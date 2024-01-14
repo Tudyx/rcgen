@@ -151,11 +151,39 @@ const ENCODE_CONFIG: pem::EncodeConfig = {
 #[non_exhaustive]
 /// The type of subject alt name
 pub enum SanType {
+	OtherName((Vec<u64>, OtherNameValue)),
 	/// Also known as E-Mail address
 	Rfc822Name(Ia5String),
 	DnsName(Ia5String),
 	URI(Ia5String),
 	IpAddress(IpAddr),
+}
+
+/// An other name entry
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
+pub enum OtherNameValue {
+	/// A string encoded using UCS-2
+	BmpString(Vec<u8>),
+	/// An ASCII string.
+	Ia5String(String),
+	/// An ASCII string containing only A-Z, a-z, 0-9, '()+,-./:=? and `<SPACE>`
+	PrintableString(String),
+	/// A string of characters from the T.61 character set
+	TeletexString(Vec<u8>),
+	/// A string encoded using UTF-32
+	UniversalString(Vec<u8>),
+	/// A string encoded using UTF-8
+	Utf8String(String),
+}
+
+impl<T> From<T> for OtherNameValue
+where
+	T: Into<String>,
+{
+	fn from(t: T) -> Self {
+		OtherNameValue::Utf8String(t.into())
+	}
 }
 
 #[cfg(feature = "x509-parser")]
@@ -172,7 +200,32 @@ fn ip_addr_from_octets(octets: &[u8]) -> Result<IpAddr, Error> {
 impl SanType {
 	#[cfg(feature = "x509-parser")]
 	fn try_from_general(name: &x509_parser::extensions::GeneralName<'_>) -> Result<Self, Error> {
+		use x509_parser::der_parser::asn1_rs::{self, FromDer, Tag, TaggedExplicit};
 		Ok(match name {
+			x509_parser::extensions::GeneralName::OtherName(oid, value) => {
+				let oid = oid.iter().ok_or(Error::CouldNotParseCertificate)?;
+				// We first remove the explicit tag ([0] EXPLICIT)
+				let (_, other_name) = TaggedExplicit::<asn1_rs::Any, _, 0>::from_der(&value)
+					.map_err(|_| Error::CouldNotParseCertificate)?;
+				let other_name = other_name.into_inner();
+
+				let data = other_name.data;
+				let try_str =
+					|data| std::str::from_utf8(data).map_err(|_| Error::CouldNotParseCertificate);
+				let other_name_value = match other_name.tag() {
+					Tag::BmpString => OtherNameValue::BmpString(data.into()),
+					Tag::Ia5String => OtherNameValue::Ia5String(try_str(data)?.to_owned()),
+					Tag::PrintableString => {
+						OtherNameValue::PrintableString(try_str(data)?.to_owned())
+					},
+					Tag::T61String => OtherNameValue::TeletexString(data.into()),
+					Tag::UniversalString => OtherNameValue::UniversalString(data.into()),
+					Tag::Utf8String => OtherNameValue::Utf8String(try_str(data)?.to_owned()),
+					_ => return Err(Error::CouldNotParseCertificate),
+				};
+
+				SanType::OtherName((oid.collect(), other_name_value))
+			},
 			x509_parser::extensions::GeneralName::RFC822Name(name) => {
 				SanType::Rfc822Name((*name).try_into()?)
 			},
@@ -190,12 +243,14 @@ impl SanType {
 	fn tag(&self) -> u64 {
 		// Defined in the GeneralName list in
 		// https://tools.ietf.org/html/rfc5280#page-38
+		const TAG_OTHER_NAME: u64 = 0;
 		const TAG_RFC822_NAME: u64 = 1;
 		const TAG_DNS_NAME: u64 = 2;
 		const TAG_URI: u64 = 6;
 		const TAG_IP_ADDRESS: u64 = 7;
 
 		match self {
+			Self::OtherName(_oid) => TAG_OTHER_NAME,
 			SanType::Rfc822Name(_name) => TAG_RFC822_NAME,
 			SanType::DnsName(_name) => TAG_DNS_NAME,
 			SanType::URI(_name) => TAG_URI,
@@ -856,6 +911,42 @@ impl CertificateParams {
 					writer.next().write_tagged_implicit(
 						Tag::context(san.tag()),
 						|writer| match san {
+							SanType::OtherName((oid, value)) => {
+								// otherName SEQUENCE { OID, [0] explicit any defined by oid }
+								// https://datatracker.ietf.org/doc/html/rfc5280#page-38
+								let oid = ObjectIdentifier::from_slice(&oid);
+								writer.write_sequence(|writer| {
+									writer.next().write_oid(&oid);
+									writer.next().write_tagged(
+										Tag::context(0),
+										|writer| match value {
+											OtherNameValue::BmpString(s) => writer
+												.write_tagged_implicit(TAG_BMPSTRING, |writer| {
+													writer.write_bytes(s)
+												}),
+											OtherNameValue::Ia5String(s) => {
+												writer.write_ia5_string(s)
+											},
+											OtherNameValue::PrintableString(s) => {
+												writer.write_printable_string(s)
+											},
+											OtherNameValue::TeletexString(s) => writer
+												.write_tagged_implicit(
+													TAG_TELETEXSTRING,
+													|writer| writer.write_bytes(s),
+												),
+											OtherNameValue::UniversalString(s) => writer
+												.write_tagged_implicit(
+													TAG_UNIVERSALSTRING,
+													|writer| writer.write_bytes(s),
+												),
+											OtherNameValue::Utf8String(s) => {
+												writer.write_utf8_string(s)
+											},
+										},
+									);
+								});
+							},
 							SanType::Rfc822Name(name)
 							| SanType::DnsName(name)
 							| SanType::URI(name) => writer.write_ia5_string(name.as_str()),
